@@ -39,6 +39,14 @@ describe("diffview.vcs.adapters.jj", function()
       return adapter._rev_map[rev]
     end
 
+    -- `first_parent_hash` shells out on its own rather than going through
+    -- `resolve_rev_arg` (it needs a `parents.first()` template, since `@-`
+    -- resolves to every parent on a merge). Stub it off the same map so
+    -- these unit tests keep exercising the "@-" entry.
+    adapter.first_parent_hash = function(_)
+      return adapter._rev_map["@-"]
+    end
+
     adapter.head_rev = function(_)
       return adapter.Rev(RevType.COMMIT, adapter._rev_map["@"] or "head_hash", true)
     end
@@ -1064,8 +1072,96 @@ describe("diffview.vcs.adapters.jj", function()
         return base, ours, theirs
       end
 
+      -- Build a conflict via rebase. The resulting working copy has a
+      -- SINGLE parent, which is the shape the old parent-based detection
+      -- could not represent at all.
+      local function make_rebase_conflict(filename)
+        filename = filename or "file.txt"
+        repo.write(filename, "base\n")
+        repo.jj({ "describe", "-m", "initial" })
+        local base = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+
+        repo.jj({ "new", "-m", "dest" })
+        repo.write(filename, "dest\n")
+        local dest = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+
+        repo.jj({ "new", base, "-m", "moved" })
+        repo.write(filename, "moved\n")
+        local moved = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+
+        repo.jj({ "new" })
+        repo.jj({ "rebase", "-r", moved, "-d", dest })
+        repo.jj({ "edit", moved })
+
+        return base, dest, moved
+      end
+
       it(
-        "detects a 2-sided conflict and returns commit ids for OURS/THEIRS/BASE",
+        "detects a rebase conflict on a single-parent working copy",
+        helpers.async_test(function()
+          if not jj_available() then
+            pending("jj not installed")
+            return
+          end
+
+          make_rebase_conflict()
+          local adapter = repo.adapter()
+
+          -- Precondition: exactly one parent. The sides still exist -- they
+          -- live in the conflict object, not the parent list.
+          local parents = repo.jj({
+            "log", "-r", "@", "--no-graph",
+            "-T", "parents.map(|c| c.commit_id()).join(\" \")",
+          })
+          assert.equals(1, #vim.split(vim.trim(parents), "%s+"))
+
+          local err, ctx = await(adapter:_query_merge_context())
+          assert.is_nil(err)
+          assert.is_not_nil(ctx)
+          assert.same({ "file.txt" }, ctx.paths)
+        end)
+      )
+
+      it(
+        "reconstructs OURS/BASE/THEIRS for a single-parent rebase conflict",
+        helpers.async_test(function()
+          if not jj_available() then
+            pending("jj not installed")
+            return
+          end
+
+          make_rebase_conflict()
+          local adapter = repo.adapter()
+          local left = adapter.Rev(RevType.COMMIT, adapter.Rev.NULL_TREE_SHA)
+          local right = adapter.Rev(RevType.LOCAL)
+          local Diff3Hor = require("diffview.scene.layouts.diff_3_hor").Diff3Hor
+
+          local _, _, conflicts = await(
+            adapter:tracked_files(
+              left,
+              right,
+              adapter:rev_to_args(left, right),
+              "working",
+              { default_layout = Diff2, merge_layout = Diff3Hor }
+            )
+          )
+
+          assert.equals(1, #conflicts)
+          assert.equals("file.txt", conflicts[1].path)
+          assert.equals("conflicting", conflicts[1].kind)
+
+          -- The three read-only sides come from a `get_data` producer keyed
+          -- by layout symbol, not from a VCS revision.
+          local producer = conflicts[1].layout.a.file.get_data
+          assert.is_true(vim.is_callable(producer))
+          assert.same({ "dest" }, producer(nil, nil, nil, "a"))
+          assert.same({ "base" }, producer(nil, nil, nil, "d"))
+          assert.same({ "moved" }, producer(nil, nil, nil, "c"))
+        end)
+      )
+
+      it(
+        "detects a 2-sided conflict and reports the conflicted paths",
         helpers.async_test(function()
           if not jj_available() then
             pending("jj not installed")
@@ -1079,11 +1175,6 @@ describe("diffview.vcs.adapters.jj", function()
           assert.is_nil(err)
           assert.is_not_nil(ctx)
           assert.same({ "file.txt" }, ctx.paths)
-          -- Commit ids are full 40-char hex.
-          assert.equals(40, #ctx.ours)
-          assert.equals(40, #ctx.theirs)
-          assert.equals(40, ctx.base and #ctx.base or 0)
-          assert.not_equals(ctx.ours, ctx.theirs)
         end)
       )
 
@@ -1173,9 +1264,13 @@ describe("diffview.vcs.adapters.jj", function()
 
           local ctx = adapter:get_merge_context()
           assert.is_not_nil(ctx)
-          assert.equals(40, #ctx.ours.hash)
-          assert.equals(40, #ctx.theirs.hash)
-          assert.equals(40, #ctx.base.hash)
+          -- Labels are scraped off the conflict markers, e.g.
+          -- `kmnzoopp c1ee2b61 "left"`. Assert they're populated and
+          -- distinct rather than pinning the exact text.
+          assert.is_true(type(ctx.ours.hash) == "string" and #ctx.ours.hash > 0)
+          assert.is_true(type(ctx.theirs.hash) == "string" and #ctx.theirs.hash > 0)
+          assert.is_true(type(ctx.base.hash) == "string" and #ctx.base.hash > 0)
+          assert.not_equals(ctx.ours.hash, ctx.theirs.hash)
         end)
       )
 
@@ -1276,7 +1371,7 @@ describe("diffview.vcs.adapters.jj", function()
       )
 
       it(
-        "sets `revs.d` to a null-tree Rev rather than nil, so 4-way layouts have a valid BASE pane",
+        "always sets a non-nil `revs.d`, so 4-way layouts have a valid BASE pane",
         helpers.async_test(function()
           if not jj_available() then
             pending("jj not installed")
@@ -1286,17 +1381,6 @@ describe("diffview.vcs.adapters.jj", function()
           make_conflict()
 
           local adapter = repo.adapter()
-          -- Force the null-tree branch: pretend fork_point returned nothing.
-          local orig_query = adapter._query_merge_context
-          adapter._query_merge_context = function(self, callback)
-            return orig_query(self, function(err, ctx)
-              if ctx then
-                ctx.base = nil
-              end
-              callback(err, ctx)
-            end)
-          end
-
           local left = adapter.Rev(RevType.COMMIT, adapter.Rev.NULL_TREE_SHA)
           local right = adapter.Rev(RevType.LOCAL)
           local args = adapter:rev_to_args(left, right)
@@ -1314,10 +1398,15 @@ describe("diffview.vcs.adapters.jj", function()
 
           assert.is_nil(err)
           assert.equals(1, #conflicts)
+
+          -- The BASE side is reconstructed from the markers, so it no
+          -- longer depends on `fork_point` resolving to anything and can
+          -- never come back nil (which would crash Diff4 on layout open).
           local entry = conflicts[1]
           local d_rev = entry.layout.d.file.rev
           assert.is_not_nil(d_rev, "revs.d must not be nil (would crash Diff4 on layout open)")
-          assert.equals(adapter.Rev.NULL_TREE_SHA, d_rev:object_name())
+          assert.equals(RevType.CUSTOM, d_rev.type)
+          assert.same({ "line1" }, entry.layout.d.file.get_data(nil, nil, nil, "d"))
         end)
       )
 

@@ -154,6 +154,25 @@ COMMANDS                                        *diffview-commands*
         (`<leader>cs*`), which read from the side panes and work
         regardless of marker style or sidedness.
 
+        The same applies to the merge layout itself. Jujutsu stores a
+        conflict as a tree-level merge that no revision addresses and no
+        template exposes, so the OURS, BASE and THEIRS panes are
+        reconstructed by splitting the materialized markers rather than
+        read from the parents of `@`. Two consequences:
+
+          • It works regardless of how the conflict arose. A rebase
+            conflict on a single-parent working copy opens in the merge
+            layout exactly like a two-parent merge does.
+          • The panes track the conflict, not the commit graph. Partially
+            resolving a conflict rewrites what Jujutsu stores, and the
+            panes follow, so a resolved region shows as common text on
+            all three sides.
+
+        A file whose conflict has no parseable markers -- binary,
+        modify/delete, or 3 or more sides -- is listed as an ordinary
+        entry instead of a merge layout, with the reason logged to
+        |:DiffviewLog|. Its content is left untouched either way.
+
         NOTE: The horizontal 3-way diff is only the default layout for the
         merge-tool, but there are multiple variations on the 3-way diff layout
         as well as a 4-way diff, and a single window layout available. The

@@ -28,6 +28,7 @@ local M = {}
 ---@class JjAdapter : VCSAdapter
 ---@operator call : JjAdapter
 ---@field _merge_context_cache? JjAdapter.MergeContextData # Set by `tracked_files` when it detects a working-copy conflict; read by `get_merge_context`.
+---@field _conflict_labels? JjAdapter.ConflictLabels # Marker labels from the first conflicted file; read by `get_merge_context`.
 local JjAdapter = oop.create_class("JjAdapter", VCSAdapter)
 
 JjAdapter.Rev = JjRev
@@ -443,6 +444,40 @@ function JjAdapter:resolve_rev_arg(rev_arg)
   return vim.trim(out[1])
 end
 
+---Resolve `@`'s first parent to a single commit id.
+---
+---`resolve_rev_arg("@-")` must not be used for this. On a merge commit `@-`
+---resolves to *every* parent, and the `commit_id` template then concatenates
+---them into one 80+ character string -- with exit code 0 and nothing on
+---stderr, so it reads as a successful resolve. The resulting "hash" fails
+---later as a `--from` argument, surfacing as a generic "failed to get status"
+---error far from the cause. (The same trap is guarded against with
+---`latest(..., 1)` in `symmetric_diff_revs`.)
+---
+---`parents.first()` yields exactly one commit, and choosing the first parent
+---matches both git's `HEAD^1` convention and the OURS side of a conflict.
+---@return string?
+function JjAdapter:first_parent_hash()
+  local out, code = self:exec_sync({
+    "show",
+    "-T",
+    "parents.first().commit_id()",
+    "@",
+    "--no-patch",
+  }, {
+    cwd = self.ctx.toplevel,
+    retry = 2,
+    fail_on_empty = true,
+    log_opt = { label = "JjAdapter:first_parent_hash()" },
+  })
+
+  if code ~= 0 or not out[1] or out[1] == "" then
+    return nil
+  end
+
+  return vim.trim(out[1])
+end
+
 ---@return JjRev?
 function JjAdapter:head_rev()
   local head_hash = self:resolve_rev_arg("@")
@@ -519,10 +554,11 @@ function JjAdapter:parse_revs(rev_arg, opt)
   local right
 
   if not rev_arg then
-    -- Wrap `@-` in `latest(...)` so a merge working copy (2+ parents) picks
-    -- the most-recent parent instead of erroring on "resolved to more than
-    -- one revision". Non-merge cases collapse back to `@-`.
-    local parent_hash = self:resolve_rev_arg("latest(@-)") or self:resolve_rev_arg("root()")
+    -- `first_parent_hash` rather than `latest(@-)`: both avoid the "resolved
+    -- to more than one revision" trap on a merge working copy, but `latest`
+    -- picks by commit timestamp, which need not be parent #1. The first
+    -- parent is what matches git's `HEAD^1` and the OURS side of a conflict.
+    local parent_hash = self:first_parent_hash() or self:resolve_rev_arg("root()")
     left = parent_hash and JjRev(RevType.COMMIT, parent_hash) or JjRev.new_null_tree()
     right = JjRev(RevType.LOCAL)
   elseif rev_arg:match("%.%.%.") then
@@ -1526,9 +1562,18 @@ end
 
 ---@class JjAdapter.MergeContextData
 ---@field paths string[] # Conflicted file paths (workspace-relative).
----@field ours string # First-parent commit id.
----@field theirs string # Second-parent commit id.
----@field base? string # Merge-base commit id; nil when `fork_point` yields nothing.
+
+---Labels scraped off the conflict markers, used only for winbar decoration.
+---@class JjAdapter.ConflictLabels
+---@field ours? string
+---@field base? string
+---@field theirs? string
+
+---@class JjAdapter.ConflictSides
+---@field ours string[]
+---@field base string[]
+---@field theirs string[]
+---@field labels JjAdapter.ConflictLabels
 
 ---@param self JjAdapter
 ---@param revset string
@@ -1583,23 +1628,128 @@ local function filter_conflict_paths(ctx, path_args)
     return nil
   end
 
-  return {
-    paths = kept,
-    ours = ctx.ours,
-    theirs = ctx.theirs,
-    base = ctx.base,
-  }
+  return { paths = kept }
 end
 
----Query the working copy for a 2-sided merge conflict context. Locates the
----nearest still-conflicted ancestor merge of `@` (which is `@` itself when
----the working copy is the merge) and derives OURS/THEIRS from its parents;
----this covers the common propagated-conflict shape where `@` is a linear
----descendant of a conflicted merge (e.g., after `jj new` on top of an
----unresolved merge). Returns nil for non-conflicts, for conflicts with no
----conflicted merge ancestor (rebase-only edit conflicts, where no ancestor
----merge is the source), and for merges with 3+ parents; the last two log a
----warning to `:DiffviewLog`.
+---Reconstruct the three sides of a materialized conflict from its markers.
+---
+---jj stores a conflict as a tree-level `Merge` (`removes=[base]`,
+---`adds=[left, right]`). Those sides are a property of the conflict object,
+---not of the commit's parent list -- a commit with a single parent carries a
+---full 3-sided conflict after a rebase, and `jj resolve` happily hands a
+---merge tool all three. There is no CLI query for them either:
+---`conflicted_files()` yields a `TreeEntry` exposing only `path()` and
+---`conflict()`.
+---
+---What *is* available is the working copy itself, which already holds every
+---side inline as diff3 markers. Rebuild a full side by walking the file and
+---substituting that side's content for each conflict region, keeping the
+---text outside the regions verbatim. This is stable under partial
+---resolution: once the user resolves a region its text stops being a marker
+---block and becomes common text, so it lands in all three sides -- which is
+---exactly right.
+---
+---Requires `conflict-marker-style = "git"`. jj's default "diff" style emits
+---`%%%%%%%`/`+++++++` sections that `parse_conflicts` doesn't recognise, so
+---no regions are found and this returns nil (the caller then degrades the
+---entry to a plain 2-way diff rather than showing a broken merge view).
+---@param lines string[]
+---@return JjAdapter.ConflictSides?
+local function split_conflict_sides(lines)
+  local regions = vcs_utils.parse_conflicts(lines)
+
+  if #regions == 0 then
+    return nil
+  end
+
+  local sides = { ours = {}, base = {}, theirs = {}, labels = {} }
+  local cursor = 1
+
+  for _, region in ipairs(regions) do
+    -- Common text preceding this region belongs to every side.
+    for k = cursor, region.first - 1 do
+      for _, name in ipairs({ "ours", "base", "theirs" }) do
+        local side = sides[name]
+        side[#side + 1] = lines[k]
+      end
+    end
+
+    for _, name in ipairs({ "ours", "base", "theirs" }) do
+      local side, part = sides[name], region[name]
+
+      for _, line in ipairs(part.content or {}) do
+        side[#side + 1] = line
+      end
+
+      -- jj writes a commit label onto each marker (e.g. `<<<<<<< qmxvxxsz
+      -- 79fdd733 "A" (rebase destination)`). OURS and BASE are labelled by
+      -- the marker that opens them, but THEIRS opens on a bare `=======`
+      -- separator and is labelled by its closing `>>>>>>>` instead. Keep
+      -- the first label seen for the winbar.
+      if not sides.labels[name] then
+        local marker = lines[name == "theirs" and part.last or part.first]
+        sides.labels[name] = marker and marker:match("^[<|>]+%s+(.+)$")
+      end
+    end
+
+    cursor = region.last + 1
+  end
+
+  for k = cursor, #lines do
+    for _, name in ipairs({ "ours", "base", "theirs" }) do
+      local side = sides[name]
+      side[#side + 1] = lines[k]
+    end
+  end
+
+  return sides
+end
+
+---Read a conflicted file out of the working copy and split it into sides.
+---@param self JjAdapter
+---@param path string
+---@return JjAdapter.ConflictSides?
+local function read_conflict_sides(self, path)
+  local abs = pl:join(self.ctx.toplevel, path)
+
+  -- Plain Lua IO rather than `vim.fn.readfile`: this runs inside the async
+  -- scan, which may land in a fast event context where calling back into
+  -- Vimscript is disallowed.
+  local fh = io.open(abs, "rb")
+  if not fh then
+    logger:warn(fmt("[JjAdapter] Could not open conflicted file: %s", abs))
+    return nil
+  end
+
+  local content = fh:read("*a")
+  fh:close()
+
+  if not content then
+    return nil
+  end
+
+  content = content:gsub("\r\n", "\n"):gsub("\n$", "")
+  local sides = split_conflict_sides(vim.split(content, "\n", { plain = true }))
+
+  if not sides then
+    logger:warn(
+      fmt(
+        "[JjAdapter] No parseable conflict markers in %s -- falling back to a "
+          .. "plain diff. Is `ui.conflict-marker-style` set to \"git\"?",
+        path
+      )
+    )
+  end
+
+  return sides
+end
+
+---List the conflicted paths in the working copy.
+---
+---Unlike the previous implementation this asks nothing about `@`'s parents:
+---parent count and conflict shape are unrelated, and gating on
+---`#parents == 2` meant every rebase conflict (one parent, three perfectly
+---good sides) fell through to a plain 2-way diff.
 ---@param self JjAdapter
 ---@param callback fun(err: string[]?, ctx: JjAdapter.MergeContextData?)
 JjAdapter._query_merge_context = async.wrap(function(self, callback)
@@ -1620,85 +1770,13 @@ JjAdapter._query_merge_context = async.wrap(function(self, callback)
   local paths = vim.tbl_filter(function(s)
     return s ~= ""
   end, vim.split(table.concat(paths_job.stdout, "\n"), "\x1f", { plain = true }))
+
   if #paths == 0 then
     callback(nil, nil)
     return
   end
 
-  -- Locate the nearest still-conflicted ancestor merge and read its parents
-  -- in one call. `ancestors(@)` includes `@` itself, so a working-copy-as-
-  -- merge still resolves to itself; `& conflicts()` restricts to merges whose
-  -- conflicts are the source of `@`'s (a resolved ancient merge in ancestry
-  -- wouldn't propagate conflicts, so its OURS/THEIRS would be unrelated to
-  -- the current conflict and mislead the 3-way layout); `latest(..., 1)`
-  -- picks the most recent such merge and guards against multi-commit output
-  -- clobbering the fixed layout below. Template line 1 is the merge's
-  -- `commit_id`; lines 2+ are its parents in positional order (index 1
-  -- OURS, index 2 THEIRS).
-  local merge_job = log_job(
-    self,
-    "latest(ancestors(@) & merges() & conflicts(), 1)",
-    [[commit_id ++ "\n" ++ parents.map(|c| c.commit_id()).join("\n")]],
-    "JjAdapter:_query_merge_context() merge"
-  )
-  if not await(merge_job) or merge_job.code ~= 0 then
-    callback(merge_job.stderr or {}, nil)
-    return
-  end
-
-  local lines = vim.tbl_filter(function(s)
-    return s ~= ""
-  end, merge_job.stdout)
-  if #lines == 0 then
-    logger:warn(
-      fmt(
-        "[JjAdapter] Skipping merge-tool layout for %d conflicted file(s): "
-          .. "no ancestor merge found (conflict has no 2-sided source).",
-        #paths
-      )
-    )
-    callback(nil, nil)
-    return
-  end
-
-  local merge_id = lines[1]
-  local parents = {}
-  for i = 2, #lines do
-    parents[#parents + 1] = lines[i]
-  end
-  if #parents ~= 2 then
-    logger:warn(
-      fmt(
-        "[JjAdapter] Skipping merge-tool layout for %d conflicted file(s): "
-          .. "nearest ancestor merge has %d parents, only 2-sided merges are supported.",
-        #paths,
-        #parents
-      )
-    )
-    callback(nil, nil)
-    return
-  end
-
-  local ctx = { paths = paths, ours = parents[1], theirs = parents[2] }
-
-  -- Anchor `fork_point` at the merge's parents, not `@-`: when `@` is a
-  -- descendant of the merge, `@-` is a single commit and `fork_point(@-)`
-  -- yields that commit itself, not the merge's base. `latest(..., 1)`
-  -- matches the sibling pattern at `symmetric_diff_revs`: bare
-  -- `fork_point(...)` can resolve to multiple commits in a criss-cross
-  -- merge, and `commit_id` templates would concatenate them into a garbage
-  -- 80+ char string without the guard.
-  local base_job = log_job(
-    self,
-    fmt("latest(fork_point(%s-), 1)", merge_id),
-    "commit_id",
-    "JjAdapter:_query_merge_context() base"
-  )
-  if await(base_job) and base_job.code == 0 and base_job.stdout[1] and base_job.stdout[1] ~= "" then
-    ctx.base = base_job.stdout[1]
-  end
-
-  callback(nil, ctx)
+  callback(nil, { paths = paths })
 end)
 
 ---Template fed to `jj diff -T ...` by `tracked_files` to list the status,
@@ -1784,6 +1862,7 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
     local _, ctx = await(self:_query_merge_context())
     merge_ctx = filter_conflict_paths(ctx, self.ctx.path_args)
     self._merge_context_cache = merge_ctx
+    self._conflict_labels = nil
   end
 
   local conflicting = {}
@@ -1812,27 +1891,59 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
 
   local conflicts = {}
   if merge_ctx then
-    -- Fall back to the null tree when `fork_point` yields no base: it keeps
-    -- `revs.d` non-nil so a Diff4 layout renders a well-formed (empty) BASE
-    -- pane instead of crashing in `File.create_buffer` on `rev.type` nil-
-    -- indexing. `JjAdapter:show` handles the null tree specially by
-    -- returning empty content.
-    local base_rev = merge_ctx.base and JjRev(RevType.COMMIT, merge_ctx.base)
-      or JjRev.new_null_tree()
     for _, path in ipairs(merge_ctx.paths) do
+      local sides = read_conflict_sides(self, path)
+
+      if not sides then
+        -- No parseable markers (binary file, modify/delete conflict, a
+        -- >2-sided conflict, or `conflict-marker-style = "diff"`). Nothing
+        -- to build a merge view out of, so show it as an ordinary entry
+        -- rather than a merge layout with empty side panes.
+        files[#files + 1] = FileEntry.with_layout(opt.default_layout, {
+          adapter = self,
+          path = path,
+          status = "U",
+          stats = {},
+          kind = kind,
+          revs = { a = left, b = right },
+        })
+        goto continue
+      end
+
+      -- Remember the labels so `get_merge_context` can decorate the winbar
+      -- without re-reading the file.
+      self._conflict_labels = self._conflict_labels or sides.labels
+
+      -- The read-only sides are content this adapter synthesised, not
+      -- anything addressable by a jj revision, so they ride on
+      -- `RevType.CUSTOM` + a `get_data` producer -- the same shape
+      -- `FileMergeView` uses for jj's external merge tool. `b` stays LOCAL
+      -- so `:write` still flushes to the working copy and jj picks the
+      -- resolution up on its next snapshot.
       conflicts[#conflicts + 1] = FileEntry.with_layout(opt.merge_layout, {
         adapter = self,
         path = path,
         status = "U",
         stats = {},
         kind = "conflicting",
+        get_data = function(_, _, _, symbol)
+          if symbol == "a" then
+            return sides.ours
+          elseif symbol == "c" then
+            return sides.theirs
+          elseif symbol == "d" then
+            return sides.base
+          end
+        end,
         revs = {
-          a = JjRev(RevType.COMMIT, merge_ctx.ours),
+          a = JjRev(RevType.CUSTOM, "ours"),
           b = JjRev(RevType.LOCAL),
-          c = JjRev(RevType.COMMIT, merge_ctx.theirs),
-          d = base_rev,
+          c = JjRev(RevType.CUSTOM, "theirs"),
+          d = JjRev(RevType.CUSTOM, "base"),
         },
       })
+
+      ::continue::
     end
   end
 
@@ -1841,21 +1952,21 @@ end)
 
 ---@return vcs.MergeContext?
 function JjAdapter:get_merge_context()
-  local ctx = self._merge_context_cache
-  if not ctx then
+  if not self._merge_context_cache then
     return nil
   end
 
-  -- Fill `ref_names` as nil for now: jj doesn't have git's colon-separated
-  -- decorations format, and looking up bookmarks/tags per side would need
-  -- extra queries. Winbar rendering only fires when `hash` is truthy, so
-  -- returning an empty table for a missing `base` (rather than an empty
-  -- string) matches the git adapter's convention and leaves the default
-  -- winbar in place.
+  -- The sides are reconstructed from markers, so there are no commit ids to
+  -- report. jj does name the commits in the marker text itself, so pass
+  -- those labels through as `hash`: the winbar only renders when `hash` is
+  -- truthy, and a label like `qmxvxxsz 79fdd733 "A" (rebase destination)` is
+  -- strictly more informative than a bare id would have been.
+  local labels = self._conflict_labels or {}
+
   return {
-    ours = { hash = ctx.ours, ref_names = nil },
-    theirs = { hash = ctx.theirs, ref_names = nil },
-    base = ctx.base and { hash = ctx.base, ref_names = nil } or {},
+    ours = { hash = labels.ours, ref_names = nil },
+    theirs = { hash = labels.theirs, ref_names = nil },
+    base = labels.base and { hash = labels.base, ref_names = nil } or {},
   }
 end
 

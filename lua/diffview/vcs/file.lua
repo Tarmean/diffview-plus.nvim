@@ -211,7 +211,11 @@ end
 File.produce_data = async.wrap(function(self, callback)
   if self.get_data and vim.is_callable(self.get_data) then
     local pos = self.symbol == "a" and "left" or "right"
-    local data = self.get_data(self.kind, self.path, pos)
+    -- `pos` collapses b/c/d into "right", which is too coarse for a merge
+    -- layout: OURS, THEIRS and BASE are three distinct sides. Pass the raw
+    -- layout symbol alongside it. Existing producers take three params and
+    -- ignore the extra argument.
+    local data = self.get_data(self.kind, self.path, pos, self.symbol)
     callback(nil, data)
   else
     local err, data = await(self.adapter:show(self.path, self.rev))
@@ -321,7 +325,10 @@ File.create_buffer = async.wrap(function(self, callback)
     elseif self.rev.type == RevType.STAGE then
       context = fmt(":%d:", self.rev.stage)
     elseif self.rev.type == RevType.CUSTOM then
-      context = "[custom]"
+      -- Several CUSTOM revs can back the same path in one layout (a merge
+      -- view's OURS/THEIRS/BASE). Without a discriminator they'd all hash
+      -- to the same buffer name and share a single buffer.
+      context = self.rev.commit and fmt("[custom:%s]", self.rev.commit) or "[custom]"
     end
 
     local fullname = pl:join("diffview://", self.adapter.ctx.dir, context, self.path)
