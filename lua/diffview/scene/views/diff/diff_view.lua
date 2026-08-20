@@ -869,6 +869,13 @@ local update_files_impl = debounce.debounce_trailing(
               old_file.status = new_file.status
               old_file:validate_stage_buffers(index_stat)
 
+              -- Carry over a per-file merge context (see below). The entry
+              -- is reused rather than replaced, so without this it would
+              -- keep serving the sides it was first scanned with.
+              if new_file.merge_ctx then
+                old_file.merge_ctx = new_file.merge_ctx
+              end
+
               if new_head then
                 old_file:update_heads(new_head)
               end
@@ -931,7 +938,14 @@ local update_files_impl = debounce.debounce_trailing(
 
     if self.merge_ctx then
       for _, entry in ipairs(self.files.conflicting) do
-        entry:update_merge_context(self.merge_ctx)
+        -- An entry may carry its own context when the sides differ per
+        -- file rather than per repository state: jj reads each conflict's
+        -- sides out of that file's own markers, so two conflicted paths in
+        -- one working copy can have been produced by different operations
+        -- and name different commits. The view-level context is the
+        -- fallback for adapters (git, hg, p4) where one repo-wide answer
+        -- is correct for every path.
+        entry:update_merge_context(entry.merge_ctx or self.merge_ctx)
       end
     end
 

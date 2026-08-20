@@ -453,10 +453,21 @@ function VCSAdapter:get_log_args(args, paths)
   oop.abstract_stub()
 end
 
+---One side of a conflict, as rendered in the merge-tool winbar. Either
+---`hash` or `label` identifies the side; `hash` is a full commit id and is
+---abbreviated for display, while `label` is adapter-supplied display text
+---shown verbatim (jj names its conflict sides in the marker text, and those
+---sides aren't addressable by any revision). An empty table means "unknown",
+---which leaves the default winbar in place.
+---@class vcs.MergeContext.Side
+---@field hash? string
+---@field label? string
+---@field ref_names? string
+
 ---@class vcs.MergeContext
----@field ours { hash: string, ref_names: string? }
----@field theirs { hash: string, ref_names: string? }
----@field base { hash: string, ref_names: string? }
+---@field ours vcs.MergeContext.Side
+---@field theirs vcs.MergeContext.Side
+---@field base vcs.MergeContext.Side
 
 ---@return vcs.MergeContext?
 function VCSAdapter:get_merge_context()

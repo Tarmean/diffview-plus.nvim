@@ -173,6 +173,16 @@ COMMANDS                                        *diffview-commands*
         entry instead of a merge layout, with the reason logged to
         |:DiffviewLog|. Its content is left untouched either way.
 
+        The 'winbar' names each side with the label Jujutsu wrote onto the
+        conflict marker, e.g. >
+            OURS (Current changes) qmxvxxsz 79fdd733 "A" (rebase destination)
+<
+        rather than an abbreviated commit id (the sides aren't addressable
+        by a revision, so there is no id to show). The labels are read per
+        file: two conflicted paths in one working copy can have been
+        produced by different operations, and each one is named after the
+        commits that produced it.
+
         NOTE: The horizontal 3-way diff is only the default layout for the
         merge-tool, but there are multiple variations on the 3-way diff layout
         as well as a 4-way diff, and a single window layout available. The

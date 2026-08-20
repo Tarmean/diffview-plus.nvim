@@ -1096,6 +1096,120 @@ describe("diffview.vcs.adapters.jj", function()
         return base, dest, moved
       end
 
+      -- Build a working copy holding two conflicts with *different*
+      -- provenance: `a.txt` conflicts between P and Q, `b.txt` between R
+      -- and S. This is the case a single repo-wide merge context can't
+      -- describe -- the marker labels differ per file.
+      local function make_divergent_conflicts()
+        repo.write("a.txt", "one\n")
+        repo.write("b.txt", "one\n")
+        repo.jj({ "describe", "-m", "base" })
+        local base = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+
+        local function side(name, file, content)
+          repo.jj({ "new", base, "-m", name })
+          repo.write(file, content)
+          return repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+        end
+
+        local p = side("P", "a.txt", "P1\n")
+        local q = side("Q", "a.txt", "Q1\n")
+        local r = side("R", "b.txt", "R2\n")
+        local s = side("S", "b.txt", "S2\n")
+
+        repo.jj({ "new", p, q, "-m", "mergeA" })
+        local merge_a = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+        repo.jj({ "new", r, s, "-m", "mergeB" })
+        local merge_b = repo.jj({ "log", "-r", "@", "--no-graph", "-T", "change_id.short()" })
+
+        -- Both conflicts propagate into this commit, each keeping the
+        -- labels of the merge that produced it.
+        repo.jj({ "new", merge_a, merge_b, "-m", "combined" })
+      end
+
+      it(
+        "gives each conflicted file its own merge context",
+        helpers.async_test(function()
+          if not jj_available() then
+            pending("jj not installed")
+            return
+          end
+
+          make_divergent_conflicts()
+
+          local adapter = repo.adapter()
+          local left = adapter.Rev(RevType.COMMIT, adapter.Rev.NULL_TREE_SHA)
+          local right = adapter.Rev(RevType.LOCAL)
+          local Diff3Hor = require("diffview.scene.layouts.diff_3_hor").Diff3Hor
+
+          local _, _, conflicts = await(
+            adapter:tracked_files(
+              left,
+              right,
+              adapter:rev_to_args(left, right),
+              "working",
+              { default_layout = Diff2, merge_layout = Diff3Hor }
+            )
+          )
+
+          assert.equals(2, #conflicts)
+
+          local by_path = {}
+          for _, entry in ipairs(conflicts) do
+            assert.is_not_nil(entry.merge_ctx, entry.path .. " has no merge_ctx")
+            by_path[entry.path] = entry.merge_ctx
+          end
+
+          -- Each file names the commits that produced *its* conflict.
+          assert.is_truthy(by_path["a.txt"].ours.label:match('"P"'))
+          assert.is_truthy(by_path["a.txt"].theirs.label:match('"Q"'))
+          assert.is_truthy(by_path["b.txt"].ours.label:match('"R"'))
+          assert.is_truthy(by_path["b.txt"].theirs.label:match('"S"'))
+        end)
+      )
+
+      it(
+        "renders each conflicted file's own labels into its winbar",
+        helpers.async_test(function()
+          if not jj_available() then
+            pending("jj not installed")
+            return
+          end
+
+          make_divergent_conflicts()
+
+          local adapter = repo.adapter()
+          local left = adapter.Rev(RevType.COMMIT, adapter.Rev.NULL_TREE_SHA)
+          local right = adapter.Rev(RevType.LOCAL)
+          local Diff3Hor = require("diffview.scene.layouts.diff_3_hor").Diff3Hor
+
+          local _, _, conflicts = await(
+            adapter:tracked_files(
+              left,
+              right,
+              adapter:rev_to_args(left, right),
+              "working",
+              { default_layout = Diff2, merge_layout = Diff3Hor }
+            )
+          )
+
+          for _, entry in ipairs(conflicts) do
+            entry:update_merge_context()
+
+            local want = entry.path == "a.txt" and { '"P"', '"Q"' } or { '"R"', '"S"' }
+            local ours_bar = entry.layout.a.file.winbar
+            local theirs_bar = entry.layout.c.file.winbar
+
+            -- The full label survives: it is not clipped to the 10-char
+            -- abbreviation `hash` gets, so the commit description is still
+            -- readable at the end of it.
+            assert.is_truthy(ours_bar:match("OURS"))
+            assert.is_truthy(ours_bar:match(want[1]), ours_bar)
+            assert.is_truthy(theirs_bar:match(want[2]), theirs_bar)
+          end
+        end)
+      )
+
       it(
         "detects a rebase conflict on a single-parent working copy",
         helpers.async_test(function()
@@ -1262,15 +1376,13 @@ describe("diffview.vcs.adapters.jj", function()
             )
           )
 
+          -- Non-nil so `view.merge_ctx` gates the merge-only keymaps, but
+          -- with empty sides: a conflict's sides belong to that conflict,
+          -- so there is no repo-wide answer to give. The real labels are
+          -- on each entry (see the per-file test above).
           local ctx = adapter:get_merge_context()
           assert.is_not_nil(ctx)
-          -- Labels are scraped off the conflict markers, e.g.
-          -- `kmnzoopp c1ee2b61 "left"`. Assert they're populated and
-          -- distinct rather than pinning the exact text.
-          assert.is_true(type(ctx.ours.hash) == "string" and #ctx.ours.hash > 0)
-          assert.is_true(type(ctx.theirs.hash) == "string" and #ctx.theirs.hash > 0)
-          assert.is_true(type(ctx.base.hash) == "string" and #ctx.base.hash > 0)
-          assert.not_equals(ctx.ours.hash, ctx.theirs.hash)
+          assert.same({ ours = {}, theirs = {}, base = {} }, ctx)
         end)
       )
 

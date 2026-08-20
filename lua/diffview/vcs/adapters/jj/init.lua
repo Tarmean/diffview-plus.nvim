@@ -28,7 +28,6 @@ local M = {}
 ---@class JjAdapter : VCSAdapter
 ---@operator call : JjAdapter
 ---@field _merge_context_cache? JjAdapter.MergeContextData # Set by `tracked_files` when it detects a working-copy conflict; read by `get_merge_context`.
----@field _conflict_labels? JjAdapter.ConflictLabels # Marker labels from the first conflicted file; read by `get_merge_context`.
 local JjAdapter = oop.create_class("JjAdapter", VCSAdapter)
 
 JjAdapter.Rev = JjRev
@@ -1705,6 +1704,26 @@ local function split_conflict_sides(lines)
   return sides
 end
 
+---Wrap marker labels in the shape the winbar consumes.
+---
+---These go in `label` rather than `hash`: they aren't commit ids (the sides
+---aren't addressable by any revision), and `hash` is rendered abbreviated to
+---10 characters, which would clip `qmxvxxsz 79fdd733 "A" (rebase
+---destination)` down to `qmxvxxsz 7`. An absent label yields an empty table,
+---matching the git adapter's convention for "unknown side" and leaving the
+---default winbar in place.
+---@param labels? JjAdapter.ConflictLabels
+---@return vcs.MergeContext
+local function merge_context_from_labels(labels)
+  labels = labels or {}
+
+  return {
+    ours = labels.ours and { label = labels.ours } or {},
+    theirs = labels.theirs and { label = labels.theirs } or {},
+    base = labels.base and { label = labels.base } or {},
+  }
+end
+
 ---Read a conflicted file out of the working copy and split it into sides.
 ---@param self JjAdapter
 ---@param path string
@@ -1862,7 +1881,6 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
     local _, ctx = await(self:_query_merge_context())
     merge_ctx = filter_conflict_paths(ctx, self.ctx.path_args)
     self._merge_context_cache = merge_ctx
-    self._conflict_labels = nil
   end
 
   local conflicting = {}
@@ -1910,9 +1928,13 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
         goto continue
       end
 
-      -- Remember the labels so `get_merge_context` can decorate the winbar
-      -- without re-reading the file.
-      self._conflict_labels = self._conflict_labels or sides.labels
+      -- Labels are per file, not per repository: each conflict names the
+      -- commits that produced *it*, and two conflicted paths in one working
+      -- copy can come from different operations (e.g. a rebase that hit one
+      -- file, then a squash that hit another). Hang the context off the
+      -- entry so each one decorates its own winbar -- the adapter-level
+      -- `get_merge_context` has no path to key on and can't say.
+      local file_merge_ctx = merge_context_from_labels(sides.labels)
 
       -- The read-only sides are content this adapter synthesised, not
       -- anything addressable by a jj revision, so they ride on
@@ -1926,6 +1948,7 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
         status = "U",
         stats = {},
         kind = "conflicting",
+        merge_ctx = file_merge_ctx,
         get_data = function(_, _, _, symbol)
           if symbol == "a" then
             return sides.ours
@@ -1950,24 +1973,25 @@ JjAdapter.tracked_files = async.wrap(function(self, left, right, args, kind, opt
   callback(nil, files, conflicts)
 end)
 
+---The view-level context, which for jj can only report *that* there is a
+---conflict, not what its sides are.
+---
+---A conflict's sides are a property of that individual conflict, so there
+---is no repo-wide answer to give: two conflicted paths in one working copy
+---can come from different operations and name entirely different commits.
+---The real labels ride on each conflicted `FileEntry`'s own `merge_ctx`
+---(see `tracked_files`), which `DiffView:update_files` prefers. This returns
+---empty sides rather than picking some file's labels to stand in for the
+---rest -- non-nil, so `view.merge_ctx` still gates the `merge_only` keymaps,
+---but with nothing to render, so an entry that somehow arrived without its
+---own context keeps the default winbar instead of a mislabelled one.
 ---@return vcs.MergeContext?
 function JjAdapter:get_merge_context()
   if not self._merge_context_cache then
     return nil
   end
 
-  -- The sides are reconstructed from markers, so there are no commit ids to
-  -- report. jj does name the commits in the marker text itself, so pass
-  -- those labels through as `hash`: the winbar only renders when `hash` is
-  -- truthy, and a label like `qmxvxxsz 79fdd733 "A" (rebase destination)` is
-  -- strictly more informative than a bare id would have been.
-  local labels = self._conflict_labels or {}
-
-  return {
-    ours = { hash = labels.ours, ref_names = nil },
-    theirs = { hash = labels.theirs, ref_names = nil },
-    base = labels.base and { hash = labels.base, ref_names = nil } or {},
-  }
+  return merge_context_from_labels(nil)
 end
 
 ---@param self JjAdapter

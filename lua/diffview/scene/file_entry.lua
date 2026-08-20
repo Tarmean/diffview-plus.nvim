@@ -222,6 +222,28 @@ function FileEntry:validate_stage_buffers(stat)
   end
 end
 
+---How one conflict side is identified in the winbar. A `label` is text the
+---adapter already formatted for display and is used verbatim: jj names its
+---conflict sides in the marker text (`qmxvxxsz 79fdd733 "A" (rebase
+---destination)`), and those sides aren't addressable by a revision, so
+---there's no hash to abbreviate and truncating the name would just cut it
+---mid-word. A `hash` is a full commit id, and is abbreviated as before.
+---@param side? vcs.MergeContext.Side
+---@return string?
+local function side_id(side)
+  if not side then
+    return nil
+  end
+
+  if side.label and side.label ~= "" then
+    return side.label
+  end
+
+  if side.hash and side.hash ~= "" then
+    return side.hash:sub(1, 10)
+  end
+end
+
 ---Update winbar info
 ---@param ctx? vcs.MergeContext
 function FileEntry:update_merge_context(ctx)
@@ -233,10 +255,11 @@ function FileEntry:update_merge_context(ctx)
   end
 
   local layout = self.layout --[[@as Diff4 ]]
+  local ours_id, theirs_id, base_id = side_id(ctx.ours), side_id(ctx.theirs), side_id(ctx.base)
 
-  if layout.a and ctx.ours.hash then
+  if layout.a and ours_id then
     layout.a.file.winbar = (" OURS (Current changes) %s %s"):format(
-      (ctx.ours.hash):sub(1, 10),
+      ours_id,
       ctx.ours.ref_names and ("(" .. ctx.ours.ref_names .. ")") or ""
     )
   end
@@ -245,16 +268,16 @@ function FileEntry:update_merge_context(ctx)
     layout.b.file.winbar = " LOCAL (Working tree)"
   end
 
-  if layout.c and ctx.theirs.hash then
+  if layout.c and theirs_id then
     layout.c.file.winbar = (" THEIRS (Incoming changes) %s %s"):format(
-      (ctx.theirs.hash):sub(1, 10),
+      theirs_id,
       ctx.theirs.ref_names and ("(" .. ctx.theirs.ref_names .. ")") or ""
     )
   end
 
-  if layout.d and ctx.base.hash then
+  if layout.d and base_id then
     layout.d.file.winbar = (" BASE (Common ancestor) %s %s"):format(
-      (ctx.base.hash):sub(1, 10),
+      base_id,
       ctx.base.ref_names and ("(" .. ctx.base.ref_names .. ")") or ""
     )
   end
@@ -436,6 +459,7 @@ function FileEntry.with_layout(layout_class, opt)
     stats = opt.stats,
     kind = opt.kind,
     commit = opt.commit,
+    merge_ctx = opt.merge_ctx,
     revs = opt.revs,
     _extra_owned = extra_owned,
     layout = effective_class({
