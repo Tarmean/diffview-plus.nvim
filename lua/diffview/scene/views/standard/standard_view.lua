@@ -96,12 +96,25 @@ function StandardView:init(opt)
 end
 
 ---Snapshot the main diff window's cursor + viewport into
----`self.cursor_map[path]`. No-op if the main window is unavailable.
+---`self.cursor_map[path]`. No-op if the main window is unavailable, or if
+---it is no longer displaying the file it was bound to.
+---
+---The buffer check matters because entries can be destroyed before the
+---snapshot runs: `update_files` wipes replaced entries' buffers, which
+---bumps the main window onto some unrelated buffer sitting at line 1.
+---Recording that would overwrite a good snapshot with a bogus one, so a
+---window that has drifted off its file is treated as having nothing to
+---save. Callers that need the pre-destroy state must snapshot before the
+---entry is torn down (see `update_files_impl`).
 ---@param path string repo-relative file path; the map key.
 function StandardView:snapshot_main_view(path)
   local layout = self.cur_layout
   local main = layout and layout:get_main_win()
   if not (main and main.id and api.nvim_win_is_valid(main.id)) then
+    return
+  end
+  local bufnr = main.file and main.file.bufnr
+  if not (bufnr and api.nvim_buf_is_valid(bufnr) and api.nvim_win_get_buf(main.id) == bufnr) then
     return
   end
   local ok, vs = pcall(api.nvim_win_call, main.id, function()

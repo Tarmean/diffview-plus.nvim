@@ -265,4 +265,93 @@ two_theirs
       eq({ "two_theirs" }, conflicts[2].theirs.content)
     end)
   end)
+
+  describe("side labels", function()
+    -- Every marker style names the same three commits; only the marker
+    -- carrying the name differs. Consumers that show provenance (the jj
+    -- adapter's merge winbar) must not have to care which style produced
+    -- the file.
+    local OURS = 'wyxvpyvp 706c19cd "A" (rebase destination)'
+    local BASE = 'nqymywtw ba7be244 "base" (parents of rebased revision)'
+    local THEIRS = 'uqqvorqw d065b4e3 "B" (rebased revision)'
+
+    ---@param c ConflictRegion
+    local function eq_labels(c)
+      eq(OURS, c.ours.label)
+      eq(BASE, c.base.label)
+      eq(THEIRS, c.theirs.label)
+    end
+
+    it("reads labels off git diff3 markers", function()
+      local conflicts = vcs_utils.parse_conflicts({
+        "a",
+        "<<<<<<< " .. OURS,
+        "B1",
+        "||||||| " .. BASE,
+        "b",
+        "=======",
+        "B2",
+        ">>>>>>> " .. THEIRS,
+        "c",
+      })
+
+      eq(1, #conflicts)
+      eq_labels(conflicts[1])
+    end)
+
+    it("reads labels off jj snapshot-style markers", function()
+      local conflicts = vcs_utils.parse_conflicts({
+        "a",
+        "<<<<<<< conflict 1 of 1",
+        "+++++++ " .. OURS,
+        "B1",
+        "------- " .. BASE,
+        "b",
+        "+++++++ " .. THEIRS,
+        "B2",
+        ">>>>>>> conflict 1 of 1 ends",
+        "c",
+      })
+
+      eq(1, #conflicts)
+      eq_labels(conflicts[1])
+    end)
+
+    it("reads labels off jj diff-style markers", function()
+      -- The `%%%%%%%` header names the base and its `\\\\\\\` continuation
+      -- names the side, so one block labels two slots.
+      local conflicts = vcs_utils.parse_conflicts({
+        "a",
+        "<<<<<<< conflict 1 of 1",
+        "%%%%%%% diff from: " .. BASE,
+        [[\\\\\\\        to: ]] .. OURS,
+        "-b",
+        "+B1",
+        "+++++++ " .. THEIRS,
+        "B2",
+        ">>>>>>> conflict 1 of 1 ends",
+        "c",
+      })
+
+      eq(1, #conflicts)
+      eq_labels(conflicts[1])
+    end)
+
+    it("labels a plain 2-way git conflict, leaving the absent base nil", function()
+      local conflicts = vcs_utils.parse_conflicts({
+        "x",
+        "<<<<<<< HEAD",
+        "mine",
+        "=======",
+        "yours",
+        ">>>>>>> topic",
+        "y",
+      })
+
+      eq(1, #conflicts)
+      eq("HEAD", conflicts[1].ours.label)
+      eq("topic", conflicts[1].theirs.label)
+      eq(nil, conflicts[1].base.label)
+    end)
+  end)
 end)

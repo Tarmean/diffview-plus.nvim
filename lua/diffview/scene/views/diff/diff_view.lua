@@ -761,6 +761,23 @@ local update_files_impl = debounce.debounce_trailing(
 
     local prev_cur_file = self.panel.cur_file
 
+    -- Snapshot the open file's cursor + viewport *before* the morph loop
+    -- below, which destroys any entry it replaces. Destroying an entry wipes
+    -- its buffers and bumps the main window onto an unrelated buffer, so by
+    -- the time `_set_file` emits `file_open_pre` there is no longer a
+    -- meaningful position to record. Adapters that replace entries on every
+    -- refresh (jj, via `force_entry_refresh_on_noop`) hit this on every
+    -- update, which is what makes a refresh-in-place — e.g. after running an
+    -- external merge tool on a still-conflicted file — land back on the same
+    -- row instead of jumping to line 1.
+    --
+    -- `file_open_pre`'s own snapshot still covers ordinary file-to-file
+    -- navigation; it no-ops here because the window has drifted off the
+    -- file's buffer by then.
+    if self.cur_entry and self.cur_entry.path then
+      self:snapshot_main_view(self.cur_entry.path)
+    end
+
     local files = {
       { cur_files = self.files.conflicting, new_files = new_files.conflicting },
       { cur_files = self.files.working, new_files = new_files.working },
@@ -869,6 +886,13 @@ local update_files_impl = debounce.debounce_trailing(
               old_file.status = new_file.status
               old_file:validate_stage_buffers(index_stat)
 
+              -- Carry over a per-file merge context (see below). The entry
+              -- is reused rather than replaced, so without this it would
+              -- keep serving the sides it was first scanned with.
+              if new_file.merge_ctx then
+                old_file.merge_ctx = new_file.merge_ctx
+              end
+
               if new_head then
                 old_file:update_heads(new_head)
               end
@@ -931,7 +955,14 @@ local update_files_impl = debounce.debounce_trailing(
 
     if self.merge_ctx then
       for _, entry in ipairs(self.files.conflicting) do
-        entry:update_merge_context(self.merge_ctx)
+        -- An entry may carry its own context when the sides differ per
+        -- file rather than per repository state: jj reads each conflict's
+        -- sides out of that file's own markers, so two conflicted paths in
+        -- one working copy can have been produced by different operations
+        -- and name different commits. The view-level context is the
+        -- fallback for adapters (git, hg, p4) where one repo-wide answer
+        -- is correct for every path.
+        entry:update_merge_context(entry.merge_ctx or self.merge_ctx)
       end
     end
 
