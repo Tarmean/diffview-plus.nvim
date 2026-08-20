@@ -1637,8 +1637,9 @@ end
 ---not of the commit's parent list -- a commit with a single parent carries a
 ---full 3-sided conflict after a rebase, and `jj resolve` happily hands a
 ---merge tool all three. There is no CLI query for them either:
----`conflicted_files()` yields a `TreeEntry` exposing only `path()` and
----`conflict()`.
+---`conflicted_files()` yields a `TreeEntry` exposing `path()`,
+---`conflict()` and `conflict_side_count()` -- the shape of the conflict,
+---never the content of its sides.
 ---
 ---What *is* available is the working copy itself, which already holds every
 ---side inline as diff3 markers. Rebuild a full side by walking the file and
@@ -1648,10 +1649,13 @@ end
 ---block and becomes common text, so it lands in all three sides -- which is
 ---exactly right.
 ---
----Requires `conflict-marker-style = "git"`. jj's default "diff" style emits
----`%%%%%%%`/`+++++++` sections that `parse_conflicts` doesn't recognise, so
----no regions are found and this returns nil (the caller then degrades the
----entry to a plain 2-way diff rather than showing a broken merge view).
+---Works with every `ui.conflict-marker-style`: `parse_conflicts` knows all
+---three of jj's marker shapes. Returns nil when it finds no region it can
+---represent -- a conflict with 3 or more sides, which jj materializes in
+---snapshot form regardless of the configured style, or a file with no
+---markers at all (binary, modify/delete). The caller then degrades the
+---entry to a plain 2-way diff rather than showing a broken merge view.
+---Nothing is written back either way; the file on disk keeps its markers.
 ---@param lines string[]
 ---@return JjAdapter.ConflictSides?
 local function split_conflict_sides(lines)
@@ -1680,15 +1684,11 @@ local function split_conflict_sides(lines)
         side[#side + 1] = line
       end
 
-      -- jj writes a commit label onto each marker (e.g. `<<<<<<< qmxvxxsz
-      -- 79fdd733 "A" (rebase destination)`). OURS and BASE are labelled by
-      -- the marker that opens them, but THEIRS opens on a bare `=======`
-      -- separator and is labelled by its closing `>>>>>>>` instead. Keep
-      -- the first label seen for the winbar.
-      if not sides.labels[name] then
-        local marker = lines[name == "theirs" and part.last or part.first]
-        sides.labels[name] = marker and marker:match("^[<|>]+%s+(.+)$")
-      end
+      -- jj names each side on its marker (e.g. `qmxvxxsz 79fdd733 "A"
+      -- (rebase destination)`); `parse_conflicts` lifts that text off
+      -- whichever marker carries it, which differs per marker style. Keep
+      -- the first one seen for the winbar.
+      sides.labels[name] = sides.labels[name] or part.label
     end
 
     cursor = region.last + 1

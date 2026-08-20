@@ -23,12 +23,12 @@ describe("diffview.vcs.adapters.jj", function()
 
     JjAdapter.get_dir = old_get_dir
 
-    -- `parse_revs` queries `latest(@-)` (merge-safe); `file_restore` queries
-    -- bare `@-`. Map both to the same commit for the non-merge case.
+    -- `file_restore` queries bare `@-`. `parse_revs` goes through
+    -- `first_parent_hash` instead (stubbed below off the same entry), so
+    -- one mapping covers both for the non-merge case.
     adapter._rev_map = {
       ["@"] = "head_hash",
       ["@-"] = "parent_hash",
-      ["latest(@-)"] = "parent_hash",
       ["root()"] = "root_hash",
       ["main"] = "main_hash",
       ["master"] = "master_hash",
@@ -143,8 +143,9 @@ describe("diffview.vcs.adapters.jj", function()
       local adapter = new_adapter()
       local left, right = adapter:parse_revs(nil, {})
 
-      -- `parse_revs`/`refresh_revs` query the wrapped form.
-      adapter._rev_map["latest(@-)"] = "next_parent_hash"
+      -- `parse_revs`/`refresh_revs` reach the parent via
+      -- `first_parent_hash`, which the fixture stubs off this entry.
+      adapter._rev_map["@-"] = "next_parent_hash"
 
       local new_left, new_right = adapter:refresh_revs(nil, left, right)
       eq("next_parent_hash", new_left.commit)
@@ -489,8 +490,9 @@ describe("diffview.vcs.adapters.jj", function()
 
         eq(true, ok)
         eq(":!jj op undo", undo)
-        -- Bare `@-` (not `latest(@-)`) so a merge working copy fails loudly
-        -- instead of silently discarding content from one parent.
+        -- Bare `@-`, never a single-parent form like `first_parent_hash`,
+        -- so a merge working copy fails loudly instead of silently
+        -- discarding content from one parent.
         eq({ "restore", "--from", "@-", "--", 'file:"src/main.lua"' }, captured_args)
       end)
     )

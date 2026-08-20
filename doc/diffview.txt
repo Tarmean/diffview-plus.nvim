@@ -154,6 +154,11 @@ COMMANDS                                        *diffview-commands*
         (`<leader>cs*`), which read from the side panes and work
         regardless of marker style or sidedness.
 
+        "Skipped" means not recognized as a conflict region: `[x`/`]x`
+        jump past it and the marker-based actions decline to act on it.
+        The markers stay in the file exactly as Jujutsu wrote them --
+        nothing is rewritten or removed.
+
         The same applies to the merge layout itself. Jujutsu stores a
         conflict as a tree-level merge that no revision addresses and no
         template exposes, so the OURS, BASE and THEIRS panes are

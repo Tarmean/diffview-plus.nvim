@@ -621,12 +621,34 @@ local function looks_like_jj_region(lines, start_idx)
   return false
 end
 
+-- Capture groups for the text a VCS writes onto a marker to name a side:
+-- git's `<<<<<<< HEAD` / `||||||| merged common ancestors` / `>>>>>>> topic`,
+-- and jj's richer `+++++++ qmxvxxsz 79fdd733 "A" (rebase destination)`. The
+-- snapshot pattern covers both `+++++++` (a side) and `-------` (the base),
+-- which differ only in which slot the caller assigns them to.
+local GIT_OURS_LABEL = [[^<<<<<<<%s+(.+)$]]
+local GIT_BASE_LABEL = [[^|||||||%s+(.+)$]]
+local GIT_THEIRS_LABEL = [[^>>>>>>>%s+(.+)$]]
+local JJ_SNAPSHOT_LABEL = [[^[%+%-][%+%-][%+%-][%+%-][%+%-][%+%-][%+%-]%s+(.+)$]]
+local JJ_DIFF_FROM_LABEL = [[diff from:%s*(.+)$]]
+local JJ_DIFF_TO_LABEL = [[to:%s*(.+)$]]
+
+---A side's `label` is the display text the VCS wrote onto that side's
+---marker (a branch name for git, a commit description for jj). It names
+---the side's provenance and is not resolvable to a revision, so treat it
+---as text: render it, don't look it up.
+---@class ConflictRegion.Side
+---@field first integer
+---@field last integer
+---@field content? string[]
+---@field label? string
+
 ---@class ConflictRegion
 ---@field first integer
 ---@field last integer
----@field ours { first: integer, last: integer, content?: string[] }
----@field base { first: integer, last: integer, content?: string[] }
----@field theirs { first: integer, last: integer, content?: string[] }
+---@field ours ConflictRegion.Side
+---@field base ConflictRegion.Side
+---@field theirs ConflictRegion.Side
 
 ---Parse one Jujutsu conflict region beginning at `start_idx` (1-based, on
 ---the `<<<<<<< conflict ...` line). Returns the assembled ConflictRegion
@@ -639,8 +661,10 @@ end
 ---@return integer consumed_upto Last line index consumed (advance past this).
 local function parse_jj_region(lines, start_idx)
   local sides = {} -- Ordered list of side contents (first = ours, second = theirs).
+  local side_labels = {} -- Parallel to `sides`: the marker text naming each.
   local base_content -- From an explicit `-------` snapshot block.
   local base_from_diff -- Reconstructed from `%%%%%%%` diff blocks' `-` lines.
+  local base_label -- Marker text naming the base, from whichever block gave it.
 
   -- At most one of these accumulators is active at a time; their presence
   -- also serves as the parser's "current block kind" state. `cur_diff_base`
@@ -650,13 +674,22 @@ local function parse_jj_region(lines, start_idx)
   local cur_diff_side -- Accumulator for `+` lines of the active `%%%%%%%` block.
   local cur_diff_base -- Accumulator for `-`/` ` lines of the active `%%%%%%%` block.
 
+  -- Set alongside `cur_diff_side` so `flush` files each label with the
+  -- content it belongs to; a `%%%%%%%` header names base and side at once.
+  local cur_diff_side_label, cur_diff_base_label
+
   local function flush()
     if cur_diff_side then
       sides[#sides + 1] = cur_diff_side
+      side_labels[#sides] = cur_diff_side_label
       -- Every diff block reconstructs the same base, so keep the first.
-      base_from_diff = base_from_diff or cur_diff_base
+      if not base_from_diff then
+        base_from_diff = cur_diff_base
+        base_label = base_label or cur_diff_base_label
+      end
     end
     cur_snapshot, cur_diff_side, cur_diff_base = nil, nil, nil
+    cur_diff_side_label, cur_diff_base_label = nil, nil
   end
 
   local i = start_idx + 1
@@ -671,19 +704,24 @@ local function parse_jj_region(lines, start_idx)
       flush()
       cur_snapshot = {}
       sides[#sides + 1] = cur_snapshot
+      side_labels[#sides] = line:match(JJ_SNAPSHOT_LABEL)
     elseif line:match(JJ_SNAPSHOT_BASE) then
       flush()
       base_content = base_content or {}
+      base_label = base_label or line:match(JJ_SNAPSHOT_LABEL)
       cur_snapshot = base_content
     elseif line:match(JJ_DIFF_FROM) then
       flush()
       cur_diff_side = {}
       cur_diff_base = {}
+      cur_diff_base_label = line:match(JJ_DIFF_FROM_LABEL)
       -- Consume the `\\\\\\\ ... to:` continuation, guarding in case a
       -- future jj format drops it: without the guard we'd swallow the
       -- first diff-body line.
       if i + 1 <= #lines and lines[i + 1]:match(JJ_DIFF_TO) then
         i = i + 1
+        -- The continuation line carries the side's label.
+        cur_diff_side_label = lines[i]:match(JJ_DIFF_TO_LABEL)
       end
     elseif line:match(JJ_CONFLICT_START) then
       -- Nested header without a trailer for the outer region: bail out
@@ -725,9 +763,9 @@ local function parse_jj_region(lines, start_idx)
     -- Sub-range first/last are only read by the git branch's auto-slicer,
     -- which we bypass here (`content` is set directly). Anchor them at
     -- the outer bounds so any incidental consumer sees a valid range.
-    ours = { first = start_idx, last = end_idx, content = sides[1] },
-    base = { first = start_idx, last = end_idx, content = base },
-    theirs = { first = start_idx, last = end_idx, content = sides[2] },
+    ours = { first = start_idx, last = end_idx, content = sides[1], label = side_labels[1] },
+    base = { first = start_idx, last = end_idx, content = base, label = base_label },
+    theirs = { first = start_idx, last = end_idx, content = sides[2], label = side_labels[2] },
   }
   return region, end_idx
 end
@@ -835,6 +873,7 @@ function M.parse_conflicts(lines, winid)
       has_start = true
       cur.ours.first = i
       cur.ours.last = i
+      cur.ours.label = line:match(GIT_OURS_LABEL)
     elseif line:match(CONFLICT_BASE) then
       if has_base then
         handle(cur)
@@ -843,6 +882,7 @@ function M.parse_conflicts(lines, winid)
 
       has_base = true
       cur.base.first = i
+      cur.base.label = line:match(GIT_BASE_LABEL)
       cur.ours.last = i - 1
     elseif line:match(CONFLICT_SEP) then
       if has_sep then
@@ -870,6 +910,9 @@ function M.parse_conflicts(lines, winid)
 
       cur.theirs.first = cur.theirs.first or i
       cur.theirs.last = i
+      -- THEIRS opens on a bare `=======`, so it is the closing `>>>>>>>`
+      -- that names it.
+      cur.theirs.label = line:match(GIT_THEIRS_LABEL)
       handle(cur)
       cur, has_start, has_base, has_sep = new_cur(), false, false, false
     end
